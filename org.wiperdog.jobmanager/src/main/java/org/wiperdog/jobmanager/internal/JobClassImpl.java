@@ -1,0 +1,632 @@
+package org.wiperdog.jobmanager.internal;
+
+import static org.quartz.JobBuilder.newJob;
+import static org.quartz.JobKey.jobKey;
+import static org.quartz.TriggerBuilder.newTrigger;
+
+import java.io.File;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Properties;
+import java.util.Set;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+
+import org.apache.log4j.Logger;
+import org.quartz.DateBuilder;
+import org.quartz.DateBuilder.IntervalUnit;
+import org.quartz.InterruptableJob;
+import org.quartz.JobDataMap;
+import org.quartz.JobDetail;
+import org.quartz.JobExecutionContext;
+import org.quartz.JobExecutionException;
+import org.quartz.JobKey;
+import org.quartz.JobListener;
+import org.quartz.ListenerManager;
+import org.quartz.Matcher;
+import org.quartz.Scheduler;
+import org.quartz.SchedulerException;
+import org.quartz.Trigger;
+import org.quartz.TriggerKey;
+import org.quartz.UnableToInterruptJobException;
+import org.quartz.impl.StdSchedulerFactory;
+import org.quartz.impl.matchers.KeyMatcher;
+import org.wiperdog.jobmanager.Constants;
+import org.wiperdog.jobmanager.JobClass;
+import org.wiperdog.jobmanager.JobExecutable;
+
+public class JobClassImpl implements JobClass {
+
+	private String name;
+	private int numConcurrency;
+	private long maxRunTime;
+	private long maxWaitTime;
+	private List<JobKey> assignedList = new ArrayList<JobKey>();
+		
+	private Set<JobKey> running = new HashSet<JobKey>();
+	private BlockingQueue<VetoedTriggerKey> vetoedQueue = new LinkedBlockingQueue<VetoedTriggerKey>();
+	private final static String REASONKEY_CONCURRENCY = JobClassImpl.class.getName();	
+	public static final String SUFFIX_CANCELJOB = "_cancel";
+	
+	private final static String NULLNAME = "NULLNAME";
+	private final static String NULLGROUP = "NULLGROUP";
+	private static final Matcher<JobKey> NULLJOBMATCHER = KeyMatcher.keyEquals(new JobKey(NULLNAME, NULLGROUP));
+	
+	public static Scheduler scheduler;
+	
+	private Logger logger = Logger.getLogger(JobClassImpl.class);
+	StdSchedulerFactory stdScheFac = new StdSchedulerFactory();
+
+	public JobClassImpl(Scheduler sched, String name) throws SchedulerException {
+		this.name = name;
+		JobClassImpl.scheduler = sched;
+		// default numConcurrency is 1
+		this.numConcurrency = 1;
+		// default runtime = near forever
+		this.maxRunTime = Long.MAX_VALUE;
+		// default wait time = near forever
+		this.maxWaitTime = Long.MAX_VALUE;
+		ListenerManager lm = sched.getListenerManager();
+		lm.addJobListener(new JobListenerImpl(), NULLJOBMATCHER);
+		
+		Properties props = new Properties();
+ 		props.setProperty(StdSchedulerFactory.PROP_THREAD_POOL_CLASS,
+ 				"org.quartz.simpl.SimpleThreadPool");
+ 		props.put("org.quartz.threadPool.threadCount", "20");
+ 		props.put("org.quartz.scheduler.instanceId","CancelJobScheduler");
+ 		props.put("org.quartz.scheduler.instanceName","CancelJobScheduler"); 		
+ 		
+ 		props.put("org.quartz.scheduler.skipUpdateCheck","true");
+
+ 	    props.put("org.quartz.threadPool.threadPriority","5");
+ 		props.put("org.quartz.threadPool.threadsInheritContextClassLoaderOfInitializingThread","true");
+ 		stdScheFac.initialize(props);
+ 		stdScheFac.getScheduler().start();
+	}
+	
+	public JobClassImpl(JobClassImpl src) throws SchedulerException {
+		name = src.name;
+		JobClassImpl.scheduler = src.scheduler;
+		src.vetoedQueue.drainTo(vetoedQueue);
+		running.addAll(src.running);
+		numConcurrency = src.numConcurrency;
+		maxWaitTime = src.maxWaitTime;
+		maxRunTime = src.maxRunTime;
+		assignedList.addAll(src.assignedList);
+		ListenerManager lm = scheduler.getListenerManager();
+		lm.removeJobListener(name);
+		lm.addJobListener(new JobListenerImpl(), NULLJOBMATCHER);
+		
+		Properties props = new Properties();
+ 		props.setProperty(StdSchedulerFactory.PROP_THREAD_POOL_CLASS,
+ 				"org.quartz.simpl.SimpleThreadPool");
+ 		props.put("org.quartz.threadPool.threadCount", "20");
+ 		props.put("org.quartz.scheduler.instanceId","CancelJobScheduler");
+ 		props.put("org.quartz.scheduler.instanceName","CancelJobScheduler"); 		
+ 		
+ 		props.put("org.quartz.scheduler.skipUpdateCheck","true");
+
+ 	    props.put("org.quartz.threadPool.threadPriority","5");
+ 		props.put("org.quartz.threadPool.threadsInheritContextClassLoaderOfInitializingThread","true");
+ 		stdScheFac.initialize(props);
+ 		stdScheFac.getScheduler().start();
+	}
+
+	public void close() {
+		ListenerManager lm;
+		try {
+			lm = scheduler.getListenerManager();
+			lm.removeJobListener(name);
+		} catch (SchedulerException e) {			
+			logger.error("failed to close JobClass: " + name, e);
+		}
+	}
+	
+	/* (non-Javadoc)
+	 * @see org.wiperdog.jobmanager.JobClass#getJobClassName()
+	 */
+	public String getName() {
+		return this.name;
+	}
+	
+	/* (non-Javadoc)
+	 * @see org.wiperdog.jobmanager.JobClass#getConcurrency()
+	 */
+	public int getConcurrency() {
+		return this.numConcurrency;
+	}
+	
+	/* (non-Javadoc)
+	 * @see org.wiperdog.jobmanager.JobClass#setConcurrency(int)
+	 */
+	public void setConcurrency(int concurrency) {
+		this.numConcurrency = concurrency;
+	}
+
+	/* (non-Javadoc)
+	 * @see org.wiperdog.jobmanager.JobClass#getMaxRunTime()
+	 */
+	public long getMaxRunTime() {
+		return this.maxRunTime;
+	}
+	
+	/* (non-Javadoc)
+	 * @see org.wiperdog.jobmanager.JobClass#setMaxRunTime(long)
+	 */
+	public void setMaxRunTime(long maxRunTime) {
+		this.maxRunTime = maxRunTime;
+	}
+	
+	/* (non-Javadoc)
+	 * @see org.wiperdog.jobmanager.JobClass#getMaxWaitTime()
+	 */
+	public long getMaxWaitTime() {
+		return this.maxWaitTime;
+	}
+	
+	/* (non-Javadoc)
+	 * @see org.wiperdog.jobmanager.JobClass#setMaxWaitTime(long)
+	 */
+	public void setMaxWaitTime(long maxWaitTime) {
+		this.maxWaitTime = maxWaitTime;
+	}
+	
+	/* (non-Javadoc)
+	 * @see org.wiperdog.jobmanager.JobClass#getAssignedList()
+	 */
+	public List<JobKey> getAssignedList() {
+		return assignedList;
+	}
+	
+	/* (non-Javadoc)
+	 * @see org.wiperdog.jobmanager.JobClass#getCurrentRunningCount()
+	 */
+	public int getCurrentRunningCount() {
+		return running.size();
+	}
+	
+	/**
+	 * Add it to the Job class.
+	 * @param key Key job
+	 */
+	public void addJob(JobKey key) {
+		System.out.println("Add Job: " + key.toString());
+		try {
+			assignedList.add(key);
+			boolean b  = scheduler.getListenerManager().addJobListenerMatcher(name, KeyMatcher.keyEquals((key)));
+			System.out.println("==== FOUND listener " + b);
+		} catch (SchedulerException e) {
+			System.out.println("Failed to add job: " + key.toString());
+			logger.error(e.getMessage());
+		}
+	}
+
+	/**
+	 * Delete a job from the job class.
+	 * @param key Key job
+	 */
+	public void deleteJob(JobKey key) {
+		System.out.println("Delete Job: " + key.toString());
+		try {
+			scheduler.getListenerManager().removeJobListenerMatcher(name, KeyMatcher.keyEquals(key));
+			assignedList.remove(key);
+		} catch (SchedulerException e) {
+			System.out.println("Failed to delete job: " + key.toString());
+			logger.error("", e);
+		}
+	}	
+	public static class RuntimeLimitterJob implements InterruptableJob {
+		private Logger logger = Logger.getLogger(Activator.LOGGERNAME);
+		public static final String KEY_JOBKEY = "jobkey";
+		//private Scheduler sched2;
+		
+		public RuntimeLimitterJob() {
+			System.out.println("***** Initialize RuntimeLimitterJob");
+		}
+		
+		public void execute(JobExecutionContext context)
+				throws JobExecutionException {
+			Date d = new Date(System.currentTimeMillis());
+			System.out.println("***** "+ d +" RuntimeLimitterJob.execute()");
+			try {				
+				//logger.trace("***** RuntimeLimitterJob.execute()");
+				JobKey jobkey = (JobKey) context.getMergedJobDataMap().get(KEY_JOBKEY);
+				
+				System.out.println("*** RuntimeLimitterJob Interrupting job(" + jobkey.getName() + ")");			
+			
+				scheduler.interrupt(jobkey);
+			} catch (UnableToInterruptJobException e) {
+				e.printStackTrace();
+				System.out.println("***** ERROR on interrupt:"/*, e*/);
+			}
+		}
+
+		public void interrupt() throws UnableToInterruptJobException {			
+			System.out.println("***** RuntimeLimitterJob.interrupt()");
+		}
+	}
+
+	Scheduler internalSched;
+	/**
+	 * @author nguyenvannghia
+	 *
+	 */
+	public class JobListenerImpl implements JobListener {
+		
+		public JobListenerImpl() {			
+		}
+
+		/* (non-Javadoc)
+		 * @see org.quartz.JobListener#jobToBeExecuted(org.quartz.JobExecutionContext)
+		 */
+		public void jobToBeExecuted(JobExecutionContext context) {
+			Trigger trigger = context.getTrigger();
+			JobKey key = trigger.getJobKey();
+			JobDetail detail = context.getJobDetail();
+			JobDataMap datamap = detail.getJobDataMap();
+			System.out.println("*****"+key.getName()+" JobListener.jobToBeExecuted()");
+			
+			@SuppressWarnings("unchecked")
+			Set<String> reasons = (Set<String>) datamap.get(Constants.KEY_PROHIBIT);
+			if (reasons == null) {
+				reasons = new HashSet<String>();
+				datamap.put(Constants.KEY_PROHIBIT, reasons);
+			}
+			// trigger with bigger priority is "re-scheduled" for immediate execution
+			if (running.size() >= numConcurrency || (! vetoedQueue.isEmpty() && trigger.getPriority() <= Trigger.DEFAULT_PRIORITY)) {
+				VetoedTriggerKey vk = new VetoedTriggerKey(trigger.getKey(), detail);
+				System.out.println("Offering into vetoedQueue, size:" + vetoedQueue.size());
+				vetoedQueue.offer(vk);
+				reasons.add(REASONKEY_CONCURRENCY);
+				System.out.println("JobListener: numConcurrency exceeded for job: " + trigger.getJobKey().toString());
+				return;
+			}
+			
+			//
+			// save key as running job
+			running.add(key);
+			// clear prohibit reason of concurrency check
+			reasons.remove(REASONKEY_CONCURRENCY);	
+			
+			if (maxRunTime != Long.MAX_VALUE && maxRunTime > 0) {
+				try {
+					// Schedule runtime over canceling job here.					
+					JobDetail cancelJob = newJob(RuntimeLimitterJob.class)
+						    .withIdentity(key.getName() + SUFFIX_CANCELJOB, "JOBMAN" + SUFFIX_CANCELJOB)
+						    .build();
+					System.out.println("+***** Insert 'RUNTIMEOVER kill' job with name: " 
+						    + key.getName() + SUFFIX_CANCELJOB+ ", group: JOBMAN" + SUFFIX_CANCELJOB
+							+ ", job will be interrupted after "+maxRunTime);
+					
+					cancelJob.getJobDataMap().put(RuntimeLimitterJob.KEY_JOBKEY, key);
+					
+					Trigger cancelTrigger = newTrigger()
+						    .withIdentity(key.getName() + SUFFIX_CANCELJOB, "JOBMAN" + SUFFIX_CANCELJOB)
+						    .startAt(DateBuilder.futureDate((int) maxRunTime, IntervalUnit.MILLISECOND))
+						    .withPriority(Trigger.DEFAULT_PRIORITY + 1)
+						    .forJob(cancelJob)
+						    .build();
+					Scheduler sched2 = stdScheFac.getScheduler();
+					Date d = sched2.scheduleJob(cancelJob, cancelTrigger);
+					
+					//Date d = context.getScheduler().scheduleJob(cancelJob, cancelTrigger);
+					System.out.println("+************** 1 " + sched2);					
+					System.out.println("+************** 2 " + context.getScheduler());
+					
+					System.out.println("+***** JOB "+ key.getName() + " will be canceled at "+d);				
+				} catch (SchedulerException e) {
+					e.printStackTrace();
+					System.out.println("failed to insert 'RUNTIMEOVER kill' job");
+				}
+			}
+		}
+
+		/* (non-Javadoc)
+		 * @see org.quartz.JobListener#jobExecutionVetoed(org.quartz.JobExecutionContext)
+		 */
+		public void jobExecutionVetoed(org.quartz.JobExecutionContext parameter) {
+			System.out.println("ConcurrencyJobListener.jobExecutionVetoed()");
+		}
+		
+		/* (non-Javadoc)
+		 * @see org.quartz.JobListener#jobWasExecuted(org.quartz.JobExecutionContext, org.quartz.JobExecutionException)
+		 */
+		public void jobWasExecuted(JobExecutionContext context, JobExecutionException jobException) {
+			System.out.println("***** "+context.getJobDetail().getKey().getName()+" JobListener.jobWasExecuted()");
+			Scheduler sched = context.getScheduler();
+			try {
+				sched.pauseAll();
+			} catch (SchedulerException e1) {
+				logger.error("Scheduler pause all action failed: " + e1.getMessage());
+				System.out.println(""/*, e1*/);
+			}
+			
+			try {
+				// Delete the RuntimeLimitter job which was scheduled in method jobTobeExecuted()
+				JobKey jobKey = jobKey(
+						context.getJobDetail().getKey().getName()  + SUFFIX_CANCELJOB,
+						"JOBMAN" + SUFFIX_CANCELJOB
+						);
+				/*JobKey jobKey = jobKey(
+						context.getJobDetail().getKey().getName()  + SUFFIX_CANCELJOB,
+						+context.getJobDetail().getKey().getGroup() + SUFFIX_CANCELJOB
+						);*/
+				boolean chkJobExist = sched.checkExists(jobKey);
+				System.out.println("+============ Job with key " + jobKey + " is exist?? "+chkJobExist);
+				if(chkJobExist && !jobKey.getName().contains("jobTest2_cancel")){
+					System.out.println("+=========== Cancel job was deleted: "+ jobKey);
+					boolean b  = sched.deleteJob(jobKey);
+					System.out.println("+=========== Result: "+b);
+				}
+				
+			} catch (SchedulerException e) {
+				logger.error(
+						"Failed to delete RuntimeLimitter job for ("
+						+ context.getJobDetail().getKey().getName() 
+						+ "), may already removed. Detail as: " 
+						+ e.getMessage()
+						);
+			}
+			try {				
+				//Remove jobKey exist in running set
+				if (running.remove(context.getTrigger().getJobKey())) {					
+					/** 
+					 * Remove oldest element from vetoed queue, then check if it can be re-scheduled
+					 *  based on its maxWaitTime.If it can not be, throw it away. 					 
+					 */
+					while (true) {
+						VetoedTriggerKey vetoedkey = vetoedQueue.poll();						
+						if (vetoedkey != null) {
+							try {
+								JobDetail job = vetoedkey.getJobDetail();
+								// Re-schedule with "run immediately trigger" if it can proceed.
+								if (vetoedkey.canProceed(maxWaitTime)) {
+									System.out.println("***** Re-launching the waiting job: " + vetoedkey.getJobDetail().getKey().toString()+ ":" + vetoedkey.getKey().toString());
+									// Check if job was durable
+									if (sched.checkExists(job.getKey())) {
+										Trigger oldTrigger = sched.getTrigger(vetoedkey.getKey());
+										Trigger rft = newTrigger()
+												.startNow()
+												// to distinguish re-fire trigger, set priority to DEFAULT + 1
+												.withPriority(Trigger.DEFAULT_PRIORITY + 1)
+												.forJob(job)
+												.build();
+										if (oldTrigger != null && ! oldTrigger.mayFireAgain()) {
+											sched.rescheduleJob(vetoedkey.getKey(), rft);
+											System.out.println("***** Re-schedule job: " + vetoedkey.getKey().toString() + ":" + rft.getKey().toString());
+										}  else {
+											sched.scheduleJob(rft);
+											System.out.println("***** Schedule Job: " + job.getKey().toString() + ":" + rft.getKey().toString());
+										}
+									} else {
+										Trigger rft = newTrigger()
+												.startNow()
+												// to distinguish re-fire trigger, set priority to DEFAULT + 1
+												.withPriority(Trigger.DEFAULT_PRIORITY + 1)
+												.forJob(job.getKey())
+												.build();
+										sched.scheduleJob(job, rft);
+										System.out.println("Schedule Job " + job.getKey().toString() + ":" + rft.getKey().toString());
+									}
+									if (logger.isTraceEnabled()) {
+										Trigger rft = sched.getTrigger(vetoedkey.getKey());
+										System.out.println(
+												"***** Trigger is updated for re-launch: " + vetoedkey.getKey().toString() + 
+												" { nextfiretime : " + rft.getNextFireTime() + 
+												", previousfiretime : " + rft.getPreviousFireTime() + "}");
+									}
+									break;
+								} else {
+									expiredWaitTime(vetoedkey);
+								}
+							} catch (SchedulerException e) {
+								System.out.println("ERROR: Failed to re-schedule vetoed job: " + vetoedkey.toString());
+								logger.error("", e);
+							} catch (Throwable t) {
+								System.out.println("Something has been thrown at post processing of job execution."/*, t*/);
+							}
+						} else {
+							break;
+						}
+					}
+				}
+			} catch (Throwable t) {
+				System.out.println("Something has been thrown at post processing of job execution."/*, t*/);
+			} finally {
+				try {
+					System.out.println("***** Resume scheduler");
+					sched.resumeAll();
+				} catch (SchedulerException e) {
+					System.out.println("failed to resume scheduler");
+					logger.error("", e);
+				}
+				logger.error("schduler resumed");
+			}
+		}
+		
+		/* (non-Javadoc)
+		 * @see org.quartz.JobListener#getName()
+		 */
+		public String getName() {
+			return name;
+		}
+
+	}
+	private void expiredWaitTime(VetoedTriggerKey vetoedkey) {
+		// wait time is over, giving up, throw it away.
+		System.out.println("waitTime exceeded for job:" + vetoedkey.getKey().toString() + ", giving up");			
+	}
+	public class VetoedTriggerKey {
+
+		private Date vetoedAt;
+		private TriggerKey triggerKey;
+		private JobDetail jobDetail;
+		private Logger logger = Logger.getLogger(VetoedTriggerKey.class);
+		
+		public VetoedTriggerKey(TriggerKey key, JobDetail job) {
+			logger.trace("VetoedTriggerKey.VetoedTriggerKey(" + key.toString() + ")");
+			this.triggerKey = key;
+			this.jobDetail =  job;
+			this.vetoedAt = new Date();
+		}
+
+		public VetoedTriggerKey(VetoedTriggerKey src) {
+			vetoedAt = src.vetoedAt;
+			triggerKey = src.triggerKey;
+			jobDetail = src.jobDetail;
+		}
+		
+		public TriggerKey getKey() {
+			return triggerKey;
+		}
+
+		/**
+		 * Test if a Trigger can be process based on MAX_WAIT_TIME
+		 * @param waitTimeMs time for a job to be waited to be execute
+		 */
+		public boolean canProceed(long waitTimeMs) {
+			if ((new Date()).getTime() - vetoedAt.getTime() < waitTimeMs) {
+				logger.trace("VetoedTriggerKey.canProceed(" + waitTimeMs + ") - true");
+				return true;
+			}
+			logger.trace("VetoedTriggerKey.canProceed(" + waitTimeMs + ") - false");
+			return false;
+		}
+
+		public JobDetail getJobDetail() {
+			return this.jobDetail;
+		}
+		public Date getVetoedDate() {
+			return vetoedAt;
+		}
+		
+		public String toString() {
+			return "{ vetoed: '" + vetoedAt + "', trigger: '" + triggerKey.toString() + "', job: '" + jobDetail.getKey().toString() + "' }";
+		}
+	}
+	
+	public static void main(String[] args) throws Exception{
+		String jcname = "testJobCls";
+		int concurrency = 1;
+		long maxruntime = 3000;
+		long maxwaittime = 999999999;
+		String jobName1 = "jobTest1";
+		String jobName2 = "jobTest2";
+		Scheduler sched = new StdSchedulerFactory().getScheduler();
+		 
+    	sched.start();
+    	
+		JobFacadeImpl jf = new JobFacadeImpl(sched);
+		JobClass jc = jf.createJobClass(jcname, concurrency, maxwaittime, maxruntime);		 
+		JobExecutableImpl executable1 = new JobExecutableImpl(jobName1, "class", "sender");
+		InterruptJob executable2 = new InterruptJob(jobName2, "class"/*, "sender"*/);
+		JobDetail jd1 = jf.createJob(executable1);
+		JobDetail jd2 = jf.createJob(executable2);
+		
+		jc.addJob(jf.jobKeyForName(jobName1));
+		jc.addJob(jf.jobKeyForName(jobName2));
+		
+		Trigger tr1 = jf.createTrigger("Trigger1", 0);
+		Trigger tr2 = jf.createTrigger("Trigger2", 0);
+		
+		jf.scheduleJob(jd1, tr1);
+		jf.scheduleJob(jd2, tr2);
+		
+		System.out.println("***** " + jobName2 + " should be interrupted !!!");
+		//sched.shutdown();
+	}
+	
+
+}
+class JobExecutableImpl implements JobExecutable {
+	String fullPathOfFile;
+	String classOfJob; 
+	String sender;
+	String jobName;
+	
+	public JobExecutableImpl(String fullPathOfFile, String classOfJob, String sender) {
+		this.fullPathOfFile = fullPathOfFile;
+		this.classOfJob = classOfJob;
+		this.sender = sender;
+	}
+	
+	public Object execute(JobDataMap params) throws InterruptedException {
+		return null;
+	}
+
+	public String getName() {
+		File f = new File(fullPathOfFile);
+		jobName = f.getName();
+		return jobName;
+	}
+
+	public String getArgumentString() {
+		// TODO Auto-generated method stub
+		return null;
+	}
+
+	public void stop(Thread thread) {
+	    System.out.println("JobExecutableImpl.stop():  " + getName());
+		thread.interrupt();
+		
+	}
+
+}
+class InterruptJob implements JobExecutable {
+	String status;
+	boolean isInterrupt;
+	String classOfJob; 
+	String sender;
+	String jobName;
+	
+	public InterruptJob(String jobname, String classOfJob/*, String sender*/) {
+		this.status = "init";
+		this.jobName = jobname;
+		this.classOfJob = classOfJob;
+		/*this.sender = sender;*/
+		this.isInterrupt = false;
+	}
+	public InterruptJob(String jobname, String classOfJob, String sender) {
+		this.status = "init";
+		this.jobName = jobname;
+		this.classOfJob = classOfJob;
+		this.isInterrupt = false;
+	}
+	
+	public Object execute(JobDataMap params) throws InterruptedException {
+		this.status = "running and will be interrupt";
+		this.isInterrupt = true;
+		Date d = new Date(System.currentTimeMillis());
+		System.out.println("*****" + d + " SLEEP "+this.jobName+" 10000 ms...");	
+		Thread.sleep(10000);
+		d = new Date(System.currentTimeMillis());
+		System.out.println("*****" + d + " WAKEUP "+this.jobName+" AFTER SLEEP 10000 ms...");		
+		this.status = "finish";		
+		this.isInterrupt = false;
+		return null;
+	}
+
+	public String getName() {
+		return this.jobName;
+	}
+	
+	public String getStatus() {
+		return this.status;
+	}
+	
+	public boolean checkInterrupt() {
+		return this.isInterrupt;
+	}
+	
+	public String getArgumentString() {
+		return null;
+	}
+
+	public void stop(Thread thread) {
+		System.out.println("********** InterruptJob.stop() "+this.jobName);
+		thread.interrupt();
+	}
+}
+
