@@ -1,0 +1,17 @@
+org\wiperdog\jobmanager\internal\JobClassImpl$JobListenerImpl.class
+org\wiperdog\jobmanager\internal\Activator.class
+org\wiperdog\jobmanager\internal\Activator$CommanderServiceTrackerCustomizer.class
+org\wiperdog\jobmanager\JobExecutable.class
+org\wiperdog\jobmanager\internal\AbstractGenericJob$SuicideJob.class
+org\wiperdog\jobmanager\internal\JobClassImpl.class
+org\wiperdog\jobmanager\internal\JobClassImpl$RuntimeLimitterJob.class
+org\wiperdog\jobmanager\internal\JobFacadeImpl.class
+org\wiperdog\jobmanager\internal\JobFacadeImpl$FacadeTriggerListener.class
+org\wiperdog\jobmanager\JobManagerException.class
+org\wiperdog\jobmanager\internal\JobClassImpl$VetoedTriggerKey.class
+org\wiperdog\jobmanager\internal\AbstractGenericJob.class
+org\wiperdog\jobmanager\JobClass.class
+org\wiperdog\jobmanager\internal\ObjectJob.class
+org\wiperdog\jobmanager\JobFacade.class
+org\wiperdog\jobmanager\internal\Activator$1.class
+org\wiperdog\jobmanager\Constants.class

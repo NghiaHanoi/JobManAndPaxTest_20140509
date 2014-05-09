@@ -1,7 +1,7 @@
 Manifest-Version: 1.0
-Bnd-LastModified: 1399609361729
+Bnd-LastModified: 1399623046263
 Build-Jdk: 1.6.0_45
-Built-By: nghia
+Built-By: nguyenvannghia
 Bundle-Activator: org.wiperdog.jobmanager.internal.Activator
 Bundle-Description: wiperdog job manager
 Bundle-License: http://www.apache.org/licenses/LICENSE-2.0.txt

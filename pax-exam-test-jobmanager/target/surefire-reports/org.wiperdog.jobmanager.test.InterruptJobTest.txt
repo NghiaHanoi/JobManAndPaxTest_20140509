@@ -1,4 +1,4 @@
 -------------------------------------------------------------------------------
 Test set: org.wiperdog.jobmanager.test.InterruptJobTest
 -------------------------------------------------------------------------------
-Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 16.891 sec
+Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 19.14 sec
